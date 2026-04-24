@@ -53,10 +53,10 @@ valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# 限速 class id：1:<port_hex>，避免和现有 1:$port（decimal）冲突时的问题
-# 这里直接用 port 作为 class minor id（与 port_traffic_limit.sh 保持一致，但 prio 使用 2 区分）
+# 限速 class id：tc 的 classid minor 按 16 进制解析，必须把端口号转成 hex
+# 否则像端口 11710 会被解析为 0x11710 (>65535) 而静默失败
 get_class_id() {
-    echo "1:$1"
+    printf "1:%x" "$1"
 }
 
 # 获取配置
@@ -90,38 +90,87 @@ delete_limit_config() {
     jq "del(.limits[] | select(.port == $1))" "$SPEED_CONFIG_FILE" > "$tmp" && mv "$tmp" "$SPEED_CONFIG_FILE"
 }
 
-# 确保根 qdisc 存在
+# 确保物理网卡上存在 htb 根 qdisc（出站）
 ensure_root_qdisc() {
     local interface=$1
-    if ! tc qdisc show dev "$interface" | grep -q "htb"; then
-        tc qdisc add dev "$interface" root handle 1: htb default 30 2>/dev/null || true
+    local root_type
+    root_type=$(tc qdisc show dev "$interface" 2>/dev/null | awk '/^qdisc .* root/ {print $2; exit}')
+    if [ "$root_type" != "htb" ]; then
+        # Debian 默认为 fq_codel/pfifo_fast，必须用 replace 强制替换
+        tc qdisc replace dev "$interface" root handle 1: htb default 10 2>>"$SPEED_LOG_FILE"
+        log "已在 $interface 上建立 htb 根 qdisc"
+    fi
+    # 默认类 1:10：未命中过滤器的流量走这里，不限速（否则 htb default 指向不存在的类会导致行为异常）
+    if ! tc class show dev "$interface" 2>/dev/null | grep -Eq '^class htb 1:10 '; then
+        tc class add dev "$interface" parent 1: classid 1:10 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
     fi
 }
 
-# 清理接口上所有 prio 2 的限速规则（不影响 port_traffic_limit.sh 使用的 prio 1）
+# 确保 ifb0 就绪（用于入站限速）
+# Linux 的 tc 根 qdisc 只能整形出站；入站需要把流量通过 ingress+mirred 重定向到 ifb0，再在 ifb0 上 htb
+ensure_ifb() {
+    local interface=$1
+    if ! lsmod | grep -q '^ifb '; then
+        modprobe ifb numifbs=1 2>>"$SPEED_LOG_FILE" || true
+    fi
+    if ! ip link show ifb0 >/dev/null 2>&1; then
+        ip link add ifb0 type ifb 2>>"$SPEED_LOG_FILE" || true
+    fi
+    ip link set dev ifb0 up 2>/dev/null || true
+
+    local ifb_root
+    ifb_root=$(tc qdisc show dev ifb0 2>/dev/null | awk '/^qdisc .* root/ {print $2; exit}')
+    if [ "$ifb_root" != "htb" ]; then
+        tc qdisc replace dev ifb0 root handle 1: htb default 10 2>>"$SPEED_LOG_FILE"
+    fi
+    if ! tc class show dev ifb0 2>/dev/null | grep -Eq '^class htb 1:10 '; then
+        tc class add dev ifb0 parent 1: classid 1:10 htb rate 10000mbit ceil 10000mbit 2>/dev/null || true
+    fi
+
+    # 物理网卡上加 ingress qdisc，并把全部入站流量重定向到 ifb0
+    if ! tc qdisc show dev "$interface" 2>/dev/null | grep -q '^qdisc ingress'; then
+        tc qdisc add dev "$interface" handle ffff: ingress 2>>"$SPEED_LOG_FILE"
+    fi
+    if ! tc filter show dev "$interface" parent ffff: 2>/dev/null | grep -q 'mirred'; then
+        tc filter add dev "$interface" parent ffff: protocol ip u32 \
+            match u32 0 0 action mirred egress redirect dev ifb0 2>>"$SPEED_LOG_FILE"
+    fi
+}
+
+# 清理接口上 prio 2 的限速规则（出站 + 入站），不影响 port_traffic_limit.sh 使用的 prio 1
 wipe_interface_rules() {
     local interface=$1
     tc filter del dev "$interface" parent 1:0 prio 2 2>/dev/null
-    # 删除 config 中记录过的所有该接口上的 class
+    tc filter del dev ifb0 parent 1:0 prio 2 2>/dev/null
     if [ -f "$SPEED_CONFIG_FILE" ]; then
         local ports
         ports=$(jq -r --arg i "$interface" '.limits[] | select(.interface == $i) | .port' "$SPEED_CONFIG_FILE" 2>/dev/null)
         while read -r p; do
             [ -z "$p" ] && continue
-            tc class del dev "$interface" classid "1:$p" 2>/dev/null
+            local cid
+            cid=$(get_class_id "$p")
+            tc class del dev "$interface" classid "$cid" 2>/dev/null
+            tc class del dev ifb0 classid "$cid" 2>/dev/null
         done <<< "$ports"
     fi
 }
 
-# 为单个端口添加 class + filter（假设已清理旧规则）
+# 为单个端口添加 class + filter：出站（sport）在物理网卡，入站（dport）在 ifb0
 add_port_rules() {
     local port=$1 speed=$2 interface=$3
     local class_id
     class_id=$(get_class_id "$port")
-    tc class add dev "$interface" parent 1: classid "$class_id" htb rate "${speed}kbit" ceil "${speed}kbit" 2>>"$SPEED_LOG_FILE"
+
+    # 出站：服务器从本地 $port 向外发送
+    tc class add dev "$interface" parent 1: classid "$class_id" htb \
+        rate "${speed}kbit" ceil "${speed}kbit" 2>>"$SPEED_LOG_FILE"
     tc filter add dev "$interface" protocol ip parent 1:0 prio 2 u32 \
         match ip sport "$port" 0xffff flowid "$class_id" 2>>"$SPEED_LOG_FILE"
-    tc filter add dev "$interface" protocol ip parent 1:0 prio 2 u32 \
+
+    # 入站：客户端访问服务器 $port（通过 ifb0 整形）
+    tc class add dev ifb0 parent 1: classid "$class_id" htb \
+        rate "${speed}kbit" ceil "${speed}kbit" 2>>"$SPEED_LOG_FILE"
+    tc filter add dev ifb0 protocol ip parent 1:0 prio 2 u32 \
         match ip dport "$port" 0xffff flowid "$class_id" 2>>"$SPEED_LOG_FILE"
 }
 
@@ -129,6 +178,7 @@ add_port_rules() {
 rebuild_interface() {
     local interface=$1
     ensure_root_qdisc "$interface"
+    ensure_ifb "$interface"
     wipe_interface_rules "$interface"
     if [ -f "$SPEED_CONFIG_FILE" ]; then
         local rows
@@ -149,10 +199,51 @@ apply_speed_limit() {
 
 remove_speed_limit_tc() {
     local port=$1 interface=$2
-    # 先显式删除该端口的 class（因为它已从 config 中移除，wipe 不会处理）
-    tc class del dev "$interface" classid "1:$port" 2>/dev/null
+    local cid
+    cid=$(get_class_id "$port")
+    # 先显式删除该端口的 class（config 已无此端口，rebuild 不会处理）
+    tc class del dev "$interface" classid "$cid" 2>/dev/null
+    tc class del dev ifb0 classid "$cid" 2>/dev/null
     rebuild_interface "$interface"
     log "已移除端口 $port 的限速"
+}
+
+# 诊断：显示当前 tc 规则
+show_tc_status() {
+    local interface
+    interface=$(get_default_interface)
+    echo -e "${CYAN}=== 物理网卡 $interface 根 qdisc ===${NC}"
+    tc qdisc show dev "$interface" 2>/dev/null || echo "无"
+    echo ""
+    echo -e "${CYAN}=== ifb0 根 qdisc ===${NC}"
+    tc qdisc show dev ifb0 2>/dev/null || echo "ifb0 未配置"
+    echo ""
+    echo -e "${CYAN}=== 出站 class (dev $interface) ===${NC}"
+    tc -s class show dev "$interface" 2>/dev/null
+    echo ""
+    echo -e "${CYAN}=== 入站 class (dev ifb0) ===${NC}"
+    tc -s class show dev ifb0 2>/dev/null
+    echo ""
+    echo -e "${CYAN}=== 出站 filter ===${NC}"
+    tc filter show dev "$interface" 2>/dev/null
+    echo ""
+    echo -e "${CYAN}=== ingress qdisc filters (重定向到 ifb0) ===${NC}"
+    tc filter show dev "$interface" parent ffff: 2>/dev/null
+    echo ""
+    echo -e "${CYAN}=== 入站 filter (dev ifb0) ===${NC}"
+    tc filter show dev ifb0 2>/dev/null
+}
+
+# 诊断：强制清理所有 tc 规则（不删 config，之后可 --apply-all 重建）
+nuke_tc_rules() {
+    local interface
+    interface=$(get_default_interface)
+    tc qdisc del dev "$interface" root 2>/dev/null
+    tc qdisc del dev "$interface" ingress 2>/dev/null
+    tc qdisc del dev ifb0 root 2>/dev/null
+    ip link set dev ifb0 down 2>/dev/null
+    ip link delete ifb0 2>/dev/null
+    log "已清理所有 tc 规则和 ifb0"
 }
 
 # 开机/重启后一次性重建所有限速
@@ -298,15 +389,26 @@ interactive_menu() {
         echo "3) 查看所有限速"
         echo "4) 启用开机自动恢复"
         echo "5) 立即重建所有限速规则"
+        echo "6) 查看 tc 规则（诊断）"
+        echo "7) 清空所有 tc 规则并重建（故障恢复）"
         echo "0) 退出"
         echo -e "${CYAN}==================================================${NC}"
-        read -p "请选择 [0-5]: " choice
+        read -p "请选择 [0-7]: " choice
         case $choice in
             1) wizard_add ;;
             2) wizard_remove ;;
             3) clear; list_limits; echo ""; read -p "按回车键继续..." _ ;;
             4) setup_boot_cron; read -p "按回车键继续..." _ ;;
             5) apply_all; read -p "按回车键继续..." _ ;;
+            6) clear; show_tc_status; echo ""; read -p "按回车键继续..." _ ;;
+            7)
+                read -p "确认清空所有 tc 规则并重建？[y/N]: " c
+                if [[ "$c" =~ ^[yY]$ ]]; then
+                    nuke_tc_rules
+                    apply_all
+                fi
+                read -p "按回车键继续..." _
+                ;;
             0) exit 0 ;;
             *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
         esac
