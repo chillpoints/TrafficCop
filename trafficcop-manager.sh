@@ -387,9 +387,10 @@ stop_all_services() {
 update_all_scripts() {
     echo -e "${CYAN}正在更新所有脚本到最新版本...${NC}"
     
-    local scripts=("trafficcop.sh" "tg_notifier.sh" "pushplus_notifier.sh" "serverchan_notifier.sh" 
-                  "port_traffic_limit.sh" "view_port_traffic.sh" "port_traffic_helper.sh" 
-                  "remove_traffic_limit.sh" "machine_limit_manager.sh")
+    local scripts=("trafficcop.sh" "tg_notifier.sh" "pushplus_notifier.sh" "serverchan_notifier.sh"
+                  "port_traffic_limit.sh" "view_port_traffic.sh" "port_traffic_helper.sh"
+                  "remove_traffic_limit.sh" "machine_limit_manager.sh"
+                  "port_speed_limit.sh" "tg_bot.sh")
     
     for script in "${scripts[@]}"; do
         if curl -fsSL "$REPO_URL/$script" -o "$WORK_DIR/$script.new" 2>/dev/null; then
@@ -403,6 +404,49 @@ update_all_scripts() {
     
     echo -e "${GREEN}脚本更新完成！${NC}"
     read -p "按回车键继续..."
+}
+
+# 端口常驻限速管理
+manage_port_speed_limit() {
+    echo -e "${CYAN}端口常驻限速管理${NC}"
+
+    if [ ! -f "$WORK_DIR/port_speed_limit.sh" ]; then
+        echo -e "${YELLOW}正在下载 port_speed_limit.sh...${NC}"
+        if ! curl -fsSL "$REPO_URL/port_speed_limit.sh" -o "$WORK_DIR/port_speed_limit.sh" 2>/dev/null; then
+            # 回退到本地
+            if [ -f "port_speed_limit.sh" ]; then
+                cp "port_speed_limit.sh" "$WORK_DIR/port_speed_limit.sh"
+            else
+                echo -e "${RED}无法获取 port_speed_limit.sh${NC}"
+                read -p "按回车键继续..."
+                return
+            fi
+        fi
+        chmod +x "$WORK_DIR/port_speed_limit.sh"
+    fi
+
+    run_script "$WORK_DIR/port_speed_limit.sh"
+}
+
+# TG 机器人管理
+manage_tg_bot() {
+    echo -e "${CYAN}TG 机器人管理${NC}"
+
+    if [ ! -f "$WORK_DIR/tg_bot.sh" ]; then
+        echo -e "${YELLOW}正在下载 tg_bot.sh...${NC}"
+        if ! curl -fsSL "$REPO_URL/tg_bot.sh" -o "$WORK_DIR/tg_bot.sh" 2>/dev/null; then
+            if [ -f "tg_bot.sh" ]; then
+                cp "tg_bot.sh" "$WORK_DIR/tg_bot.sh"
+            else
+                echo -e "${RED}无法获取 tg_bot.sh${NC}"
+                read -p "按回车键继续..."
+                return
+            fi
+        fi
+        chmod +x "$WORK_DIR/tg_bot.sh"
+    fi
+
+    run_script "$WORK_DIR/tg_bot.sh"
 }
 
 # 机器限速管理
@@ -443,6 +487,8 @@ show_main_menu() {
     echo -e "${YELLOW}10) 使用预设配置${NC}"
     echo -e "${YELLOW}11) 停止所有服务${NC}"
     echo -e "${GREEN}12) 更新所有脚本到最新版本${NC}"
+    echo -e "${CYAN}13) 端口常驻限速管理${NC}"
+    echo -e "${CYAN}14) TG 机器人管理（/start 绑定端口）${NC}"
     echo -e "${YELLOW}0) 退出${NC}"
     echo -e "${PURPLE}====================================${NC}"
     echo ""
@@ -455,7 +501,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -p "请选择操作 [0-12]: " choice
+        read -p "请选择操作 [0-14]: " choice
         
         case $choice in
             1)
@@ -493,6 +539,12 @@ main() {
                 ;;
             12)
                 update_all_scripts
+                ;;
+            13)
+                manage_port_speed_limit
+                ;;
+            14)
+                manage_tg_bot
                 ;;
             0)
                 echo -e "${GREEN}感谢使用TrafficCop管理工具！${NC}"
