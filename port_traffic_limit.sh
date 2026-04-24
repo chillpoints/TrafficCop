@@ -942,7 +942,7 @@ update_script() {
     echo ""
     
     # GitHub 原始文件链接
-    local GITHUB_RAW="https://raw.githubusercontent.com/ypq123456789/TrafficCop/main/port_traffic_limit.sh"
+    local GITHUB_RAW="https://raw.githubusercontent.com/chillpoints/TrafficCop/main/port_traffic_limit.sh"
     local TEMP_FILE="/tmp/port_traffic_limit_new.sh"
     
     # 显示当前版本
